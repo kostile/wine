@@ -820,6 +820,7 @@ static void free_per_thread_data(void)
     HeapFree( GetProcessHeap(), 0, ptb->he_buffer );
     HeapFree( GetProcessHeap(), 0, ptb->se_buffer );
     HeapFree( GetProcessHeap(), 0, ptb->pe_buffer );
+    HeapFree( GetProcessHeap(), 0, ptb->fd_cache );
 
     HeapFree( GetProcessHeap(), 0, ptb );
     NtCurrentTeb()->WinSockData = NULL;
@@ -2040,6 +2041,12 @@ INT WINAPI WS_getsockopt(SOCKET s, INT level,
           debugstr_sockopt(level, optname), debugstr_optval(optval, 0),
           optlen, optlen ? *optlen : 0);
 
+    if (!socket_list_find( s ))
+    {
+        SetLastError( WSAENOTSOCK );
+        return -1;
+    }
+
     switch(level)
     {
     case WS_SOL_SOCKET:
@@ -3082,142 +3089,250 @@ int WINAPI WS_recvfrom(SOCKET s, char *buf, INT len, int flags,
         return n;
 }
 
-
-/* as FD_SET(), but returns 1 if the fd was added, 0 otherwise */
-static int add_fd_to_set( SOCKET fd, struct WS_fd_set *set )
+/* allocate a poll array for the corresponding fd sets */
+static struct pollfd *fd_sets_to_poll( const WS_fd_set *readfds, const WS_fd_set *writefds,
+                                       const WS_fd_set *exceptfds, int *count_ptr )
 {
-    unsigned int i;
+    unsigned int i, j = 0, count = 0;
+    struct pollfd *fds;
+    struct per_thread_data *ptb = get_per_thread_data();
 
-    for (i = 0; i < set->fd_count; ++i)
+    if (readfds) count += readfds->fd_count;
+    if (writefds) count += writefds->fd_count;
+    if (exceptfds) count += exceptfds->fd_count;
+    *count_ptr = count;
+    if (!count)
     {
-        if (set->fd_array[i] == fd)
-            return 0;
+        SetLastError(WSAEINVAL);
+        return NULL;
     }
 
-    if (set->fd_count < WS_FD_SETSIZE)
+    /* check if the cache can hold all descriptors, if not do the resizing */
+    if (ptb->fd_count < count)
     {
-        set->fd_array[set->fd_count++] = fd;
-        return 1;
+        if (!(fds = HeapAlloc(GetProcessHeap(), 0, count * sizeof(fds[0]))))
+        {
+            SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+            return NULL;
+        }
+        HeapFree(GetProcessHeap(), 0, ptb->fd_cache);
+        ptb->fd_cache = fds;
+        ptb->fd_count = count;
     }
+    else
+        fds = ptb->fd_cache;
 
-    return 0;
+    if (readfds)
+        for (i = 0; i < readfds->fd_count; i++, j++)
+        {
+            fds[j].fd = get_sock_fd( readfds->fd_array[i], FILE_READ_DATA, NULL );
+            if (fds[j].fd == -1) goto failed;
+            fds[j].revents = 0;
+            if (is_fd_bound(fds[j].fd, NULL, NULL) == 1)
+            {
+                fds[j].events = POLLIN;
+            }
+            else
+            {
+                release_sock_fd( readfds->fd_array[i], fds[j].fd );
+                fds[j].fd = -1;
+                fds[j].events = 0;
+            }
+        }
+    if (writefds)
+        for (i = 0; i < writefds->fd_count; i++, j++)
+        {
+            WSAPROTOCOL_INFOW info;
+            int size;
+
+            fds[j].fd = get_sock_fd( writefds->fd_array[i], FILE_WRITE_DATA, NULL );
+            if (fds[j].fd == -1) goto failed;
+            fds[j].revents = 0;
+            if (is_fd_bound(fds[j].fd, NULL, NULL) == 1 ||
+                (ws_protocol_info( writefds->fd_array[i], TRUE, &info, &size )
+                 && info.iSocketType == SOCK_DGRAM))
+            {
+                fds[j].events = POLLOUT;
+            }
+            else
+            {
+                release_sock_fd( writefds->fd_array[i], fds[j].fd );
+                fds[j].fd = -1;
+                fds[j].events = 0;
+            }
+        }
+    if (exceptfds)
+        for (i = 0; i < exceptfds->fd_count; i++, j++)
+        {
+            fds[j].fd = get_sock_fd( exceptfds->fd_array[i], 0, NULL );
+            if (fds[j].fd == -1) goto failed;
+            fds[j].revents = 0;
+            if (is_fd_bound(fds[j].fd, NULL, NULL) == 1)
+            {
+                int oob_inlined = 0;
+                socklen_t olen = sizeof(oob_inlined);
+
+                fds[j].events = POLLHUP;
+
+                /* Check if we need to test for urgent data or not */
+                getsockopt(fds[j].fd, SOL_SOCKET, SO_OOBINLINE, (char*) &oob_inlined, &olen);
+                if (!oob_inlined)
+                    fds[j].events |= POLLPRI;
+            }
+            else
+            {
+                release_sock_fd( exceptfds->fd_array[i], fds[j].fd );
+                fds[j].fd = -1;
+                fds[j].events = 0;
+            }
+        }
+    return fds;
+
+failed:
+    count = j;
+    j = 0;
+    if (readfds)
+        for (i = 0; i < readfds->fd_count && j < count; i++, j++)
+            if (fds[j].fd != -1) release_sock_fd( readfds->fd_array[i], fds[j].fd );
+    if (writefds)
+        for (i = 0; i < writefds->fd_count && j < count; i++, j++)
+            if (fds[j].fd != -1) release_sock_fd( writefds->fd_array[i], fds[j].fd );
+    if (exceptfds)
+        for (i = 0; i < exceptfds->fd_count && j < count; i++, j++)
+            if (fds[j].fd != -1) release_sock_fd( exceptfds->fd_array[i], fds[j].fd );
+    return NULL;
 }
 
-
-/***********************************************************************
- *      select   (ws2_32.18)
- */
-int WINAPI WS_select( int count, WS_fd_set *read_ptr, WS_fd_set *write_ptr,
-                      WS_fd_set *except_ptr, const struct WS_timeval *timeout)
+/* release the file descriptor obtained in fd_sets_to_poll */
+/* must be called with the original fd_set arrays, before calling get_poll_results */
+static void release_poll_fds( const WS_fd_set *readfds, const WS_fd_set *writefds,
+                              const WS_fd_set *exceptfds, struct pollfd *fds )
 {
-    char buffer[offsetof( struct afd_poll_params, sockets[WS_FD_SETSIZE * 3] )] = {0};
-    struct afd_poll_params *params = (struct afd_poll_params *)buffer;
-    struct WS_fd_set read, write, except;
-    ULONG params_size, i, j;
-    SOCKET poll_socket = 0;
-    IO_STATUS_BLOCK io;
-    HANDLE sync_event;
-    int ret_count = 0;
-    NTSTATUS status;
+    unsigned int i, j = 0;
 
-    TRACE( "read %p, write %p, except %p, timeout %p\n", read_ptr, write_ptr, except_ptr, timeout );
-
-    WS_FD_ZERO( &read );
-    WS_FD_ZERO( &write );
-    WS_FD_ZERO( &except );
-    if (read_ptr) read = *read_ptr;
-    if (write_ptr) write = *write_ptr;
-    if (except_ptr) except = *except_ptr;
-
-    if (!(sync_event = get_sync_event())) return -1;
-
-    if (timeout)
-        params->timeout = timeout->tv_sec * -10000000 + timeout->tv_usec * -10;
-    else
-        params->timeout = TIMEOUT_INFINITE;
-
-    for (i = 0; i < read.fd_count; ++i)
+    if (readfds)
     {
-        params->sockets[params->count].socket = read.fd_array[i];
-        params->sockets[params->count].flags = AFD_POLL_READ | AFD_POLL_ACCEPT | AFD_POLL_HUP;
-        ++params->count;
-        poll_socket = read.fd_array[i];
+        for (i = 0; i < readfds->fd_count; i++, j++)
+            if (fds[j].fd != -1) release_sock_fd( readfds->fd_array[i], fds[j].fd );
     }
-
-    for (i = 0; i < write.fd_count; ++i)
+    if (writefds)
     {
-        params->sockets[params->count].socket = write.fd_array[i];
-        params->sockets[params->count].flags = AFD_POLL_WRITE;
-        ++params->count;
-        poll_socket = write.fd_array[i];
+        for (i = 0; i < writefds->fd_count; i++, j++)
+            if (fds[j].fd != -1) release_sock_fd( writefds->fd_array[i], fds[j].fd );
     }
-
-    for (i = 0; i < except.fd_count; ++i)
+    if (exceptfds)
     {
-        params->sockets[params->count].socket = except.fd_array[i];
-        params->sockets[params->count].flags = AFD_POLL_OOB | AFD_POLL_CONNECT_ERR;
-        ++params->count;
-        poll_socket = except.fd_array[i];
-    }
-
-    if (!params->count)
-    {
-        SetLastError( WSAEINVAL );
-        return -1;
-    }
-
-    params_size = offsetof( struct afd_poll_params, sockets[params->count] );
-
-    status = NtDeviceIoControlFile( (HANDLE)poll_socket, sync_event, NULL, NULL, &io,
-                                    IOCTL_AFD_POLL, params, params_size, params, params_size );
-    if (status == STATUS_PENDING)
-    {
-        if (WaitForSingleObject( sync_event, INFINITE ) == WAIT_FAILED)
-            return -1;
-        status = io.u.Status;
-    }
-    if (status == STATUS_TIMEOUT) status = STATUS_SUCCESS;
-    if (!status)
-    {
-        /* pointers may alias, so clear them all first */
-        if (read_ptr) WS_FD_ZERO( read_ptr );
-        if (write_ptr) WS_FD_ZERO( write_ptr );
-        if (except_ptr) WS_FD_ZERO( except_ptr );
-
-        for (i = 0; i < params->count; ++i)
+        for (i = 0; i < exceptfds->fd_count; i++, j++)
         {
-            unsigned int flags = params->sockets[i].flags;
-            SOCKET s = params->sockets[i].socket;
-
-            for (j = 0; j < read.fd_count; ++j)
+            if (fds[j].fd == -1) continue;
+            release_sock_fd( exceptfds->fd_array[i], fds[j].fd );
+            if (fds[j].revents & POLLHUP)
             {
-                if (read.fd_array[j] == s
-                        && (flags & (AFD_POLL_READ | AFD_POLL_ACCEPT | AFD_POLL_HUP | AFD_POLL_CLOSE)))
-                {
-                    ret_count += add_fd_to_set( s, read_ptr );
-                    flags &= ~AFD_POLL_CLOSE;
-                }
-            }
-
-            if (flags & AFD_POLL_CLOSE)
-                status = STATUS_INVALID_HANDLE;
-
-            for (j = 0; j < write.fd_count; ++j)
-            {
-                if (write.fd_array[j] == s && (flags & AFD_POLL_WRITE))
-                    ret_count += add_fd_to_set( s, write_ptr );
-            }
-
-            for (j = 0; j < except.fd_count; ++j)
-            {
-                if (except.fd_array[j] == s && (flags & (AFD_POLL_OOB | AFD_POLL_CONNECT_ERR)))
-                    ret_count += add_fd_to_set( s, except_ptr );
+                int fd = get_sock_fd( exceptfds->fd_array[i], 0, NULL );
+                if (fd != -1)
+                    release_sock_fd( exceptfds->fd_array[i], fd );
+                else
+                    fds[j].revents = 0;
             }
         }
     }
+}
 
-    SetLastError( NtStatusToWSAError( status ) );
-    return status ? -1 : ret_count;
+static int do_poll(struct pollfd *pollfds, int count, int timeout)
+{
+    struct timeval tv1, tv2;
+    int ret, torig = timeout;
+
+    if (timeout > 0) gettimeofday( &tv1, 0 );
+
+    while ((ret = poll( pollfds, count, timeout )) < 0)
+    {
+        if (errno != EINTR) break;
+        if (timeout < 0) continue;
+        if (timeout == 0) return 0;
+
+        gettimeofday( &tv2, 0 );
+
+        tv2.tv_sec  -= tv1.tv_sec;
+        tv2.tv_usec -= tv1.tv_usec;
+        if (tv2.tv_usec < 0)
+        {
+            tv2.tv_usec += 1000000;
+            tv2.tv_sec  -= 1;
+        }
+
+        timeout = torig - (tv2.tv_sec * 1000) - (tv2.tv_usec + 999) / 1000;
+        if (timeout <= 0) return 0;
+    }
+    return ret;
+}
+
+/* map the poll results back into the Windows fd sets */
+static int get_poll_results( WS_fd_set *readfds, WS_fd_set *writefds, WS_fd_set *exceptfds,
+                             const struct pollfd *fds )
+{
+    const struct pollfd *poll_writefds  = fds + (readfds ? readfds->fd_count : 0);
+    const struct pollfd *poll_exceptfds = poll_writefds + (writefds ? writefds->fd_count : 0);
+    unsigned int i, k, total = 0;
+
+    if (readfds)
+    {
+        for (i = k = 0; i < readfds->fd_count; i++)
+        {
+            if (fds[i].revents ||
+                    (readfds == writefds && (poll_writefds[i].revents & POLLOUT) && !(poll_writefds[i].revents & POLLHUP)) ||
+                    (readfds == exceptfds && poll_exceptfds[i].revents))
+                readfds->fd_array[k++] = readfds->fd_array[i];
+        }
+        readfds->fd_count = k;
+        total += k;
+    }
+    if (writefds && writefds != readfds)
+    {
+        for (i = k = 0; i < writefds->fd_count; i++)
+        {
+            if (((poll_writefds[i].revents & POLLOUT) && !(poll_writefds[i].revents & POLLHUP)) ||
+                    (writefds == exceptfds && poll_exceptfds[i].revents))
+                writefds->fd_array[k++] = writefds->fd_array[i];
+        }
+        writefds->fd_count = k;
+        total += k;
+    }
+    if (exceptfds && exceptfds != readfds && exceptfds != writefds)
+    {
+        for (i = k = 0; i < exceptfds->fd_count; i++)
+            if (poll_exceptfds[i].revents) exceptfds->fd_array[k++] = exceptfds->fd_array[i];
+        exceptfds->fd_count = k;
+        total += k;
+    }
+    return total;
+}
+
+/***********************************************************************
+ *		select			(WS2_32.18)
+ */
+int WINAPI WS_select(int nfds, WS_fd_set *ws_readfds,
+                     WS_fd_set *ws_writefds, WS_fd_set *ws_exceptfds,
+                     const struct WS_timeval* ws_timeout)
+{
+    struct pollfd *pollfds;
+    int count, ret, timeout = -1;
+
+    TRACE("read %p, write %p, excp %p timeout %p\n",
+          ws_readfds, ws_writefds, ws_exceptfds, ws_timeout);
+
+    if (!(pollfds = fd_sets_to_poll( ws_readfds, ws_writefds, ws_exceptfds, &count )))
+        return SOCKET_ERROR;
+
+    if (ws_timeout)
+        timeout = (ws_timeout->tv_sec * 1000) + (ws_timeout->tv_usec + 999) / 1000;
+
+    ret = do_poll(pollfds, count, timeout);
+    release_poll_fds( ws_readfds, ws_writefds, ws_exceptfds, pollfds );
+
+    if (ret == -1) SetLastError(wsaErrno());
+    else ret = get_poll_results( ws_readfds, ws_writefds, ws_exceptfds, pollfds );
+    return ret;
 }
 
 
